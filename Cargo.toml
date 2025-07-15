@@ -11,4 +11,8 @@ crate-type = ["cdylib"]
 ffmpeg-next = "*"
 tempfile = "*"
 base64 = "*"
-pyo3 = { version = "*", features = ["extension-module"] }
+
+[dependencies.pyo3]
+version = "*"
+# "abi3-py38" tells pyo3 (and maturin) to build using the stable ABI with minimum Python version 3.8
+features = ["extension-module", "abi3-py38"]

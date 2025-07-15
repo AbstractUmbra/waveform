@@ -106,6 +106,7 @@ pub fn use_ffmpeg(audio: &[u8]) -> Result<Vec<u8>, ffmpeg::Error> {
 }
 
 #[pyfunction]
+#[pyo3(name = "generate")]
 fn generate_waveform_from_audio(audio: &[u8]) -> (String, f64) {
     let sample_rate = 48000;
     let bytes_per_sample = 2;

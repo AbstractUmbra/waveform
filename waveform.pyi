@@ -1,0 +1,3 @@
+from typing import Tuple
+
+def generate(audio: bytes) -> Tuple[str, float]: ...
