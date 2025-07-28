@@ -1,128 +1,143 @@
-use ffmpeg_next::{self as ffmpeg, Dictionary};
-
-use base64::prelude::*;
+use base64::{engine::general_purpose, Engine as _};
+use bytemuck;
 use pyo3::prelude::*;
 use pyo3::pyfunction;
-use std::io::Write;
+use std::io::Cursor;
+use std::num::{NonZeroU32, NonZeroU8};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::default;
+use vorbis_rs::{VorbisEncoderBuilder, VorbisError};
 
-pub fn calculate_duration(pcm_data: Vec<u8>, sample_rate: u64, bytes_per_sample: u64) -> f64 {
-    pcm_data.len() as f64 / (sample_rate * bytes_per_sample) as f64
+#[pyclass]
+struct AudioResult {
+    ogg_data: Vec<u8>,
+    waveform_base64: String,
+    duration_seconds: f64,
 }
 
-pub fn extract_waveform_points(
-    pcm_data: Vec<u8>,
-    samples_needed: usize,
-    samples_per_point: usize,
-) -> std::io::Result<Vec<u8>> {
-    let mut pcm_stream = &pcm_data[..];
-    let mut waveform_points: Vec<u8> = Vec::with_capacity(samples_needed);
+fn decode_to_pcm(input: &[u8]) -> Result<(Vec<f32>, usize, u32), Box<dyn std::error::Error>> {
+    let hint = Hint::new();
+    let cursor = Cursor::new(input.to_vec());
+    let boxed_cursor: Box<dyn symphonia::core::io::MediaSource> = Box::new(cursor);
+    let mss = MediaSourceStream::new(boxed_cursor, Default::default());
 
-    for i in 0..samples_needed {
-        let mut max_amplitude: f32 = 0.0;
-
-        // Calculate max amplitude for this point
-        for _ in 0..samples_per_point {
-            if pcm_stream.len() >= 2 {
-                let sample_bytes = &pcm_stream[0..2];
-                let sample =
-                    i16::from_le_bytes([sample_bytes[0], sample_bytes[1]]) as f32 / 32768.0;
-                max_amplitude = max_amplitude.max(sample.abs());
-
-                pcm_stream = &pcm_stream[2..]; // Move to the next sample
-            } else {
-                break; // No more samples
-            }
-        }
-
-        // Normalize amplitude to 0-255
-        let point = std::cmp::min(255, (max_amplitude * 255.0) as u8);
-        waveform_points.push(point);
-
-        // Skip bytes to align with the next sample point
-        let bytes_to_skip = ((i + 1) * pcm_data.len() / samples_needed)
-            .saturating_sub(pcm_data.len() - pcm_stream.len());
-        pcm_stream = &pcm_stream[bytes_to_skip.min(pcm_stream.len())..];
-    }
-
-    Ok(waveform_points)
-}
-
-pub fn use_ffmpeg(audio: &[u8]) -> Result<Vec<u8>, ffmpeg::Error> {
-    ffmpeg::init().unwrap();
-
-    let mut input_file = tempfile::NamedTempFile::new().expect("unable to create tempfile.");
-    input_file
-        .write_all(audio)
-        .expect("Unable to write audio data to temporary file path");
-
-    let fp = input_file.into_temp_path();
-
-    let mut options_dict = Dictionary::new();
-    options_dict.set("f", "mp3");
-
-    let mut input = ffmpeg::format::input_with_dictionary(&fp, options_dict)?;
-    let input_stream = input
-        .streams()
-        .best(ffmpeg::media::Type::Audio)
-        .ok_or(ffmpeg::Error::StreamNotFound)?;
-    let audio_stream_index = input_stream.index();
-
-    let codec_context = ffmpeg::codec::Context::from_parameters(input_stream.parameters())?;
-    let mut decoder = codec_context.decoder().audio()?;
-
-    let mut resampler = ffmpeg::software::resampling::Context::get(
-        decoder.format(),
-        decoder.channel_layout(),
-        decoder.rate(),
-        ffmpeg::format::Sample::I16(ffmpeg_next::format::sample::Type::Packed),
-        ffmpeg::channel_layout::ChannelLayout::MONO,
-        48000,
+    let probed = default::get_probe().format(
+        &hint,
+        mss,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
     )?;
+    let mut format = probed.format;
 
-    let mut decoded_frame = ffmpeg::frame::Audio::empty();
-    let mut pcm_buffer: Vec<u8> = Vec::new();
-    for (stream, packet) in input.packets() {
-        if stream.index() == audio_stream_index {
-            decoder.send_packet(&packet)?;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or("No supported audio tracks")?;
+    let mut decoder = default::get_codecs().make(&track.codec_params, &Default::default())?;
 
-            while decoder.receive_frame(&mut decoded_frame).is_ok() {
-                let mut output_frame = ffmpeg::frame::Audio::empty();
-                resampler.run(&decoded_frame, &mut output_frame)?;
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or("Unknown sample rate")?;
+    let channels = track
+        .codec_params
+        .channels
+        .ok_or("Unknown channels")?
+        .count();
 
-                pcm_buffer.extend_from_slice(output_frame.data(0));
+    let mut pcm = Vec::new();
+    let track_id = track.id;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(pkt) => pkt,
+            Err(err) => {
+                use symphonia::core::errors::Error;
+                match err {
+                    Error::ResetRequired => break,
+                    Error::IoError(_) | Error::DecodeError(_) => continue,
+                    _ => break,
+                }
             }
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                let mut sample_buf =
+                    SampleBuffer::<f32>::new(audio_buf.capacity() as u64, *audio_buf.spec());
+                sample_buf.copy_interleaved_ref(audio_buf);
+                pcm.extend_from_slice(sample_buf.samples());
+            }
+            Err(_) => continue,
         }
     }
 
-    decoder.send_eof()?;
-    while decoder.receive_frame(&mut decoded_frame).is_ok() {
-        let mut output_frame = ffmpeg::frame::Audio::empty();
+    Ok((pcm, channels, sample_rate))
+}
 
-        resampler.run(&decoded_frame, &mut output_frame)?;
-        pcm_buffer.extend_from_slice(output_frame.data(0));
+fn encode_to_ogg(pcm: &[f32], channels: usize, sample_rate: u32) -> Result<Vec<u8>, VorbisError> {
+    let mut output = Vec::new();
+
+    let rate_nz = NonZeroU32::new(sample_rate).expect("blah.");
+
+    let ch_nz = NonZeroU8::new(channels as u8).expect("blah.");
+
+    let mut builder = VorbisEncoderBuilder::new(rate_nz, ch_nz, &mut output)?;
+    let mut encoder = builder.build()?;
+
+    let frame_count = pcm.len() / channels;
+    let mut planar = vec![Vec::with_capacity(frame_count); channels];
+    for (i, &sample) in pcm.iter().enumerate() {
+        planar[i % channels].push(sample);
     }
+    let planar_refs: Vec<&[f32]> = planar.iter().map(Vec::as_slice).collect();
 
-    Ok(pcm_buffer)
+    encoder.encode_audio_block(&planar_refs)?;
+    encoder.finish()?;
+
+    Ok(output)
+}
+fn compute_waveform_base64(pcm: &[f32], chunk_size: usize) -> String {
+    let waveform: Vec<f32> = pcm
+        .chunks(chunk_size)
+        .map(|chunk| chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max))
+        .collect();
+
+    let bytes: &[u8] = bytemuck::cast_slice(&waveform);
+
+    general_purpose::STANDARD.encode(bytes)
+}
+
+fn process_audio(input_data: &[u8]) -> AudioResult {
+    let (pcm, channels, sample_rate) =
+        decode_to_pcm(input_data).expect("Unable to process data as PCM.");
+    let ogg_data = encode_to_ogg(&pcm, channels, sample_rate)
+        .expect("Unable to encode the audio data to OGG format.");
+    let waveform_base64 = compute_waveform_base64(&pcm, 1024);
+
+    let total_samples = pcm.len();
+    let duration_seconds = total_samples as f64 / (channels as f64 * sample_rate as f64);
+
+    AudioResult {
+        ogg_data,
+        waveform_base64,
+        duration_seconds,
+    }
 }
 
 #[pyfunction]
 #[pyo3(name = "generate")]
-fn generate_waveform_from_audio(audio: &[u8]) -> (String, f64) {
-    let sample_rate = 48000;
-    let bytes_per_sample = 2;
-
-    let pcm = use_ffmpeg(audio).expect("Unable to treat the input audio as waveform builder.");
-
-    let duration: f64 = calculate_duration(pcm.clone(), sample_rate, bytes_per_sample);
-
-    let samples_needed = std::cmp::min(256, (duration * 10.0).round() as usize);
-    let samples_per_point = pcm.len() / (bytes_per_sample as usize * samples_needed);
-
-    let waveform_points = extract_waveform_points(pcm, samples_needed, samples_per_point)
-        .expect("Unable to pull waveform points from audio data");
-    let waveform_b64 = BASE64_STANDARD.encode(waveform_points);
-
-    (waveform_b64, duration)
+fn generate_waveform_from_audio(audio: &[u8]) -> AudioResult {
+    process_audio(audio)
 }
 
 #[pymodule]
@@ -147,6 +162,9 @@ mod tests {
             .expect("Unable to read audio file into buffer");
 
         let result = generate_waveform_from_audio(&buf);
-        println!("{:#?}\n\n{:#?}", result.0, result.1)
+        println!(
+            "{:#?}\n\n{:#?}",
+            result.duration_seconds, result.waveform_base64
+        )
     }
 }

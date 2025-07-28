@@ -8,9 +8,11 @@ name = "waveform"
 crate-type = ["cdylib"]
 
 [dependencies]
-ffmpeg-next = "*"
 tempfile = "*"
 base64 = "*"
+symphonia = { version = "0.5.4", features = ["mp3", "flac", "vorbis"] }
+vorbis_rs = "0.5.5"
+bytemuck = "1.23.1"
 
 [dependencies.pyo3]
 version = "*"
